@@ -1,0 +1,65 @@
+[[queues]]
+name = "default"
+durable = true
+auto_delete = false
+[queues.arguments]
+x-dead-letter-exchange = "dlx"
+x-dead-letter-routing-key = "phone"
+x-queue-type = "classic"
+
+
+[[queues]]
+name = "mail-errors"
+durable = true
+auto_delete = false
+[queues.arguments]
+x-dead-letter-exchange = "dlx"
+x-dead-letter-routing-key = "mail"
+x-message-ttl = 30000
+x-queue-type = "classic"
+
+
+[[queues]]
+name = "mail"
+durable = true
+auto_delete = false
+[queues.arguments]
+x-dead-letter-exchange = "dlx"
+x-dead-letter-routing-key = "mail-errors"
+x-queue-type = "classic"
+
+
+[[queues]]
+name = "phone"
+durable = true
+auto_delete = false
+[queues.arguments]
+x-dead-letter-exchange = "dlx"
+x-dead-letter-routing-key = "mail"
+x-queue-type = "classic"
+
+
+[[exchanges]]
+name = "dlx"
+type = "direct"
+
+
+[[bindings]]
+source = "dlx"
+destination = "mail"
+routing_key = "mail"
+type = "queue"
+
+
+[[bindings]]
+source = "dlx"
+destination = "mail-errors"
+routing_key = "mail-errors"
+type = "queue"
+
+
+[[bindings]]
+source = "dlx"
+destination = "phone"
+routing_key = "phone"
+type = "queue"
