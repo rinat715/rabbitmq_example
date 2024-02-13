@@ -9,22 +9,19 @@ import (
 )
 
 type Consumer struct {
-	queueName       string
-	consumerName    string
-	deliveries      <-chan amqp.Delivery
-	channel         *Channel
-	notifyChanClose chan *amqp.Error // другое чем chanel.notifyChanClose
-	callback        func(data []byte) error
-	IsReconnected   chan bool
+	queueName      string
+	consumerName   string
+	deliveries     <-chan amqp.Delivery
+	channel        *Channel
+	callback       func(data []byte) error
+	IsDisconnected chan *amqp.Error
+	IsReconnected  chan bool
 }
 
 func (c *Consumer) consume() error {
-	if c.channel.ch == nil {
-		return errNotConnected
-	}
 
 	var err error
-	c.deliveries, err = c.channel.ch.Consume(
+	c.deliveries, err = c.channel.Consume(
 		c.queueName,
 		c.consumerName,
 		false,
@@ -39,17 +36,8 @@ func (c *Consumer) consume() error {
 	return nil
 }
 
-func (c *Consumer) init() error {
-	err := c.consume()
-	if err != nil {
-		return err
-	}
-	c.notifyChanClose = c.channel.ch.NotifyClose(make(chan *amqp.Error, 1))
-	return nil
-}
-
 func (c *Consumer) Consume(ctx context.Context) error {
-	err := c.init()
+	err := c.consume()
 	if err != nil {
 		logger.Debug("Could not start consuming: %s\n", err)
 		return err
@@ -59,14 +47,17 @@ func (c *Consumer) Consume(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 
-		case <-c.notifyChanClose:
+		case <-c.IsDisconnected:
 
-			<-c.IsReconnected
-
-			err := c.init()
-			if err != nil {
-				logger.Debug("Could not start consuming: %s\n", err)
-				return err
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-c.IsReconnected:
+				err := c.consume()
+				if err != nil {
+					logger.Debug("Could not start consuming: %s\n", err)
+					return err
+				}
 			}
 
 			logger.Debug("консумер реконнетед")
@@ -95,10 +86,11 @@ func (c *Consumer) Consume(ctx context.Context) error {
 
 func NewConsumer(channel *Channel, queueName string, consumerName string, callback func(data []byte) error) *Consumer {
 	return &Consumer{
-		queueName:     queueName,
-		consumerName:  consumerName,
-		channel:       channel,
-		callback:      callback,
-		IsReconnected: channel.NotifyReconnect(make(chan bool, 1)),
+		queueName:      queueName,
+		consumerName:   consumerName,
+		channel:        channel,
+		callback:       callback,
+		IsReconnected:  channel.NotifyReconnect(make(chan bool, 1)),
+		IsDisconnected: channel.NotifyDisconnect(make(chan *amqp.Error, 1)),
 	}
 }

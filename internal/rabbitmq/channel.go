@@ -35,108 +35,105 @@ type Channeler interface {
 }
 
 type Channel struct {
-	ch              Channeler
-	notifyChanClose chan *amqp.Error
-	notified        []chan bool
-	done            chan bool
-	IsReady         bool
+	Channeler
+	IsDisconnected     chan *amqp.Error
+	notifiedReconnect  []chan bool
+	notifiedDisconnect []chan *amqp.Error
+	IsReady            bool
 }
 
-func (c *Channel) Connect(conn Connector) error {
-	var err error
-	if c.ch, err = conn.Channel(); err != nil {
-		logger.Error(err)
-		return err
+func (c *Channel) connect(conn Connector) (Channeler, error) {
+	ch, err := conn.Channel()
+	if err != nil {
+		return nil, err
 	}
-
-	if err := c.ch.Confirm(false); err != nil {
-		logger.Error(err)
-		return err
+	if err := ch.Confirm(false); err != nil {
+		return nil, err
 	}
-
-	c.notifyChanClose = c.ch.NotifyClose(make(chan *amqp.Error, 1))
-	c.IsReady = true
-
-	return nil
+	return ch, err
 }
 
-func (c *Channel) handleReConnect(conn Connector) error {
+func (c *Channel) Connect(ctx context.Context, conn Connector) error {
+	for {
+		ch, err := c.connect(conn)
+
+		if err != nil {
+			select {
+			case <-time.After(reInitDelay):
+				continue
+			case <-ctx.Done():
+				return err
+			}
+		}
+
+		c.Channeler = ch
+		c.IsDisconnected = c.NotifyClose(make(chan *amqp.Error, 1))
+		c.IsReady = true
+		return nil
+	}
+
+}
+
+func (c *Channel) handleReConnect(ctx context.Context, conn Connector) error {
 	for {
 		select {
-		case <-c.notifyChanClose:
-			c.IsReady = false
+		case channel_error := <-c.IsDisconnected:
+			if !c.IsReady {
+				return nil
+			}
+
+			logger.Debug("Channel closed. Re-running init...")
+			c.SendNotifyIsDisconnect(channel_error)
 
 			if conn.IsClosed() {
 				return errNotConnected
 			}
 
-			logger.Debug("Channel closed. Re-running init...")
-			for {
-				err := c.Connect(conn)
-
-				if err != nil {
-					select {
-					case <-time.After(reInitDelay):
-						continue
-					case <-c.done:
-						return nil
-					}
-				}
-				c.SendNotifyIsReconnect()
-				break
+			err := c.Connect(ctx, conn)
+			if err != nil {
+				continue
 			}
-		case <-c.done:
+
+			c.SendNotifyIsReconnect()
+
+		case <-ctx.Done():
 			return nil
 		}
 	}
 }
 
 func (c *Channel) NotifyReconnect(receiver chan bool) chan bool {
-	c.notified = append(c.notified, receiver)
+	c.notifiedReconnect = append(c.notifiedReconnect, receiver)
 	return receiver
 }
 
 func (c *Channel) SendNotifyIsReconnect() {
-	for _, i := range c.notified {
+	for _, i := range c.notifiedReconnect {
 		i <- true
 	}
 }
 
-func (c *Channel) Close() error {
-	c.done <- true
-	close(c.done)
+func (c *Channel) NotifyDisconnect(receiver chan *amqp.Error) chan *amqp.Error {
+	c.notifiedDisconnect = append(c.notifiedDisconnect, receiver)
+	return receiver
+}
 
-	for _, i := range c.notified {
+func (c *Channel) SendNotifyIsDisconnect(err *amqp.Error) {
+	for _, i := range c.notifiedDisconnect {
+		i <- err
+	}
+}
+
+func (c *Channel) Close() error {
+	c.IsReady = false
+
+	for _, i := range c.notifiedReconnect {
 		close(i)
 	}
 
-	err := c.ch.Close()
-	if err != nil {
-		return err
+	for _, i := range c.notifiedDisconnect {
+		close(i)
 	}
-	return nil
-}
 
-func (c *Channel) create_queue(queue Queue) error {
-	_, err := c.ch.QueueDeclare(queue.Name, queue.Durable, queue.AutoDelete, false, false, queue.Arguments)
-	return err
-}
-
-func (c *Channel) create_exchange(exchange Exchange) error {
-	return c.ch.ExchangeDeclare(exchange.Name, exchange.Type, true, false, false, false, exchange.Arguments)
-}
-
-func (c *Channel) create_bind(binding Binding) error {
-	if binding.Type == exchangeType {
-		return c.ch.ExchangeBind(binding.Destination, binding.RoutingKey, binding.Source, false, binding.Arguments)
-	}
-	if binding.Type == queueType {
-		return c.ch.QueueBind(binding.Destination, binding.RoutingKey, binding.Source, false, binding.Arguments)
-	}
-	return errors.New("wrong binding type") // TODO перенести в валидацию toml чтобы передавать в ошибке номер строчки
-
-}
-
-func NewChannel() *Channel {
-	return &Channel{}
+	return c.Channeler.Close()
 }
