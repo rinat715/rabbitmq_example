@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rabbitmq/amqp091-go"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -20,165 +21,221 @@ type Connector interface {
 	Channel() (*amqp.Channel, error)
 	Close() error
 	IsClosed() bool
+	Connect(ctx context.Context) error
+	HandleReconnect(ctx context.Context) error
 }
 
-type Client struct {
-	addr            string
-	connection      Connector
-	notifyConnClose chan *amqp.Error
-	get_conn        func(url string, config amqp.Config) (*amqp.Connection, error)
-	configAmqp      amqp.Config
-	channels        []*Channel
-	count_channels  int
-	mu              sync.Mutex
-	IsReady         bool
+type Connection struct {
+	*amqp.Connection
+	addr           string
+	name           string
+	IsDisconnected chan *amqp.Error
+	IsReconnected  chan bool
 }
 
-func (c *Client) connect() error {
+func (conn *Connection) connect() (*amqp091.Connection, error) {
+	configAmqp := amqp.Config{Properties: amqp.NewConnectionProperties()}
+	configAmqp.Properties.SetClientConnectionName(conn.name)
 
-	var err error
-	c.connection, err = c.get_conn(c.addr, c.configAmqp)
-	if err != nil {
-		return err
-	}
-
-	c.notifyConnClose = c.connection.NotifyClose(make(chan *amqp.Error, 1))
-
-	return nil
+	return amqp.DialConfig(conn.addr, configAmqp)
 }
 
-func (client *Client) Connect(ctx context.Context) {
+func (conn *Connection) Connect(ctx context.Context) error {
 	for {
-		err := client.connect()
+		connect, err := conn.connect()
 
 		if err != nil {
 			logger.Debug("Failed to connect. Retrying...")
 
 			select {
 			case <-ctx.Done():
-				return
+				return errNotConnected // Заменить на ошибку Context end
 			case <-time.After(reconnectDelay):
 				continue
 			}
-
 		}
-		client.IsReady = true
-		break
+		conn.Connection = connect
+		conn.IsDisconnected = conn.NotifyClose(make(chan *amqp.Error, 1))
+
+		return nil
 	}
 }
 
-func (client *Client) HandleReconnect(ctx context.Context) {
+func (conn *Connection) HandleReconnect(ctx context.Context) error {
 	for {
+		select {
+		case <-ctx.Done():
+			return errNotConnected // Заменить на ошибку Context end
+		case <-conn.IsDisconnected:
+			logger.Debug("Connection closed. Reconnecting...")
+
+			err := conn.Connect(ctx)
+			if err != nil {
+				return err
+			}
+			conn.IsReconnected <- true
+		}
+	}
+}
+
+type ChannelPool struct {
+	mu             sync.Mutex
+	channels       []*Channel
+	count_channels int
+}
+
+func (c *ChannelPool) appendCh(channel *Channel) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.channels = append(c.channels, channel)
+	c.count_channels++
+}
+
+type Client struct {
+	ChannelPool
+	connection    Connector
+	IsReconnected chan bool
+}
+
+func (client *Client) Connect(ctx context.Context) error {
+	err := client.connection.Connect(ctx)
+	if err == nil {
+		go client.connection.HandleReconnect(ctx)
+	}
+	return err
+}
+
+func (client *Client) HandleReconnect(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return errNotConnected // Заменить на ошибку Context end
+		case <-client.IsReconnected:
+			logger.Info("Подключение восстановлено")
+
+			for _, channel := range client.channels {
+				err := channel.Connect(ctx, client.connection) // Заменить на ошибку Context end
+				if err != nil {
+					channel.SendNotifyIsReconnect()
+				}
+			}
+		}
+	}
+}
+
+func (c *Client) createCh(ctx context.Context) (*Channel, error) {
+	if c.connection.IsClosed() {
+		return nil, errNotConnected
+	}
+
+	channel := &Channel{}
+
+	for {
+		err := channel.Connect(ctx, c.connection)
+
+		if err == nil {
+			go channel.handleReConnect(ctx, c.connection) // кто обработает ошибку errNotConnected?
+			c.appendCh(channel)
+			return channel, nil
+		}
 
 		select {
 		case <-ctx.Done():
-			return
-		case <-client.notifyConnClose:
-			logger.Debug("Connection closed. Reconnecting...")
-
-			for {
-				err := client.connect()
-
-				if err != nil {
-					logger.Debug("Failed to connect. Retrying...")
-
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(reconnectDelay):
-						continue
-					}
-
-				}
-
-				break
-			}
-
-			logger.Info("Подключение восстановлено")
-			for _, c := range client.channels {
-				c.Connect(client.connection)
-				go c.handleReConnect(client.connection)
-				c.SendNotifyIsReconnect()
-			}
+			return nil, err
+		case <-time.After(reInitDelay):
+			continue
 		}
 	}
 }
 
-func (c *Client) createCh() *Channel {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for {
-		if c.IsReady {
-
-			c.count_channels++
-			channel := NewChannel()
-			c.channels = append(c.channels, channel)
-
-			channel.Connect(c.connection)
-			go channel.handleReConnect(c.connection)
-
-			return channel
-		}
-
-		<-time.After(reInitDelay)
+func (c *Client) NewProduser(ctx context.Context, exchange string, routing_key string) (*Producer, error) {
+	channel, err := c.createCh(ctx)
+	if err != nil {
+		return nil, err
 	}
+	return NewProduser(channel, exchange, routing_key)
 }
 
-func (c *Client) NewProduser(exchange string, routing_key string) (*Producer, error) {
-	return NewProduser(c.createCh(), exchange, routing_key)
+func (c *Client) NewConsumer(ctx context.Context, queueName string, consumer string, callback func(data []byte) error) (*Consumer, error) {
+	channel, err := c.createCh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return NewConsumer(channel, queueName, consumer, callback), nil
 }
 
-func (c *Client) NewConsumer(queueName string, consumer string, callback func(data []byte) error) *Consumer {
-	return NewConsumer(c.createCh(), queueName, consumer, callback)
-}
+func (c *Client) CreateDefinitions(ctx context.Context, definition *Definition) error {
 
-func (c *Client) CreateDefinitions(definition *Definition) error {
 	if definition == nil {
 		return errors.New("empty definition struct")
 	}
-	channel := c.createCh()
+	channel, err := c.createCh(ctx) // TODO удалить после использования
+	logger.Debug("создан канал")
+	if err != nil {
+		return err
+	}
 
-	for _, q := range definition.Queues {
-		err := channel.create_queue(q)
+	for _, queue := range definition.Queues {
+		_, err := channel.QueueDeclare(queue.Name, queue.Durable, queue.AutoDelete, false, false, queue.Arguments)
 		if err != nil {
 			logger.Error("не создалась очередь: %s\n", err)
 		}
 	}
 
-	for _, e := range definition.Exchanges {
-		err := channel.create_exchange(e)
+	for _, exchange := range definition.Exchanges {
+		err := channel.ExchangeDeclare(exchange.Name, exchange.Type, true, false, false, false, exchange.Arguments)
 		if err != nil {
 			logger.Error("не создался обменник: %s\n", err)
 		}
 	}
 
-	for _, b := range definition.Bindings {
-		err := channel.create_bind(b)
-		if err != nil {
-			logger.Error("не создалась привязка: %s\n", err)
+	for _, binding := range definition.Bindings {
+		if binding.Type == exchangeType {
+			err := channel.ExchangeBind(binding.Destination, binding.RoutingKey, binding.Source, false, binding.Arguments)
+			if err != nil {
+				logger.Error("не создалась привязка: %s\n", err)
+			}
+		}
+
+		if binding.Type == queueType {
+			err := channel.QueueBind(binding.Destination, binding.RoutingKey, binding.Source, false, binding.Arguments)
+			if err != nil {
+				logger.Error("не создалась привязка: %s\n", err)
+			}
 		}
 	}
+	err = channel.Close()
+	if err != nil {
+		logger.Error("не закрылся канал: %s\n", err)
+		return err
+	}
 	return nil
+
 }
 
 func (client *Client) Close() error {
-	logger.Debug("Close is stopping")
-	if !client.IsReady {
+	logger.Debug("client is stopping")
+	if client.connection.IsClosed() {
 		return errAlreadyClosed
 	}
 
 	for _, ch := range client.channels {
-		ch.Close()
+		err := ch.Close()
+		if err != nil {
+			logger.Error("не закрылся канал: %s\n", err)
+		}
 	}
 
-	client.connection.Close()
+	return client.connection.Close()
+}
 
-	client.IsReady = false
-	return nil
+func (client *Client) IsReady() bool {
+	return !client.connection.IsClosed()
 }
 
 func New(name string, addr string) *Client {
-	configAmqp := amqp.Config{Properties: amqp.NewConnectionProperties()}
-	configAmqp.Properties.SetClientConnectionName(name)
-	return &Client{configAmqp: configAmqp, addr: addr, get_conn: amqp.DialConfig}
+	client := &Client{IsReconnected: make(chan bool)}
+	client.connection = &Connection{name: name, addr: addr, IsReconnected: client.IsReconnected}
+	return client
 }

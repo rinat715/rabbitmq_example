@@ -11,24 +11,13 @@ import (
 )
 
 type Producer struct {
-	exchange      string
-	routing_key   string
-	channel       *Channel
-	publishes     chan uint64            // номера отправленных сообщений
-	confirms      chan amqp.Confirmation //
-	IsReconnected chan bool
-}
-
-func (p *Producer) ReInit(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-p.IsReconnected:
-			p.confirms = p.channel.ch.NotifyPublish(make(chan amqp.Confirmation, 1))
-			logger.Info("паблишер реконнетед")
-		}
-	}
+	exchange       string
+	routing_key    string
+	channel        *Channel
+	publishes      chan uint64            // номера отправленных сообщений
+	confirms       chan amqp.Confirmation //
+	IsReconnected  chan bool
+	IsDisconnected chan *amqp.Error
 }
 
 func (p *Producer) Publish(ctx context.Context, body []byte) error {
@@ -36,46 +25,41 @@ func (p *Producer) Publish(ctx context.Context, body []byte) error {
 	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
-	var seqNo uint64
 	for {
-		if p.channel.IsReady && p.channel.ch != nil {
-			seqNo = p.channel.ch.GetNextPublishSeqNo()
-			break
+		seqNo := p.channel.GetNextPublishSeqNo()
+		if err := p.channel.PublishWithContext(
+			ctx,
+			p.exchange,    // publish to an exchange
+			p.routing_key, // routing to 0 or more queues
+			false,         // mandatory  указание Rabbit складировать сообщения, не имеющие маршрута в какую-либо очередь в отдельный Exchange
+			false,         // immediate
+			amqp.Publishing{
+				Headers:         amqp.Table{},
+				ContentType:     "application/json",
+				ContentEncoding: "application/json",
+				Body:            body,
+				DeliveryMode:    amqp.Transient, // 1=non-persistent, 2=persistent
+				Priority:        0,              // 0-9
+				// a bunch of application/implementation-specific fields
+			},
+		); err != nil {
+			return fmt.Errorf("exchange publish: %s", err)
 		}
+		p.publishes <- seqNo
+
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(resendDelay):
-			continue
-		}
-	}
+		case <-p.IsDisconnected:
 
-	for {
-		if p.channel.IsReady && p.channel.ch != nil {
-			if err := p.channel.ch.PublishWithContext(ctx,
-				p.exchange,    // publish to an exchange
-				p.routing_key, // routing to 0 or more queues
-				false,         // mandatory  указание Rabbit складировать сообщения, не имеющие маршрута в какую-либо очередь в отдельный Exchange
-				false,         // immediate
-				amqp.Publishing{
-					Headers:         amqp.Table{},
-					ContentType:     "application/json",
-					ContentEncoding: "application/json",
-					Body:            body,
-					DeliveryMode:    amqp.Transient, // 1=non-persistent, 2=persistent
-					Priority:        0,              // 0-9
-					// a bunch of application/implementation-specific fields
-				},
-			); err != nil {
-				return fmt.Errorf("exchange publish: %s", err)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-p.IsReconnected:
+				p.confirms = p.channel.NotifyPublish(make(chan amqp.Confirmation, 1))
+				logger.Info("паблишер реконнетед")
 			}
-			p.publishes <- seqNo
-			return nil
-		}
 
-		select {
-		case <-ctx.Done():
-			return nil
 		case <-time.After(resendDelay):
 			continue
 		}
@@ -114,8 +98,9 @@ func NewProduser(channel *Channel, exchange string, routing_key string) (*Produc
 		routing_key,
 		channel,
 		make(chan uint64, 8),
-		channel.ch.NotifyPublish(make(chan amqp.Confirmation, 1)),
+		channel.NotifyPublish(make(chan amqp.Confirmation, 1)),
 		channel.NotifyReconnect(make(chan bool, 1)),
+		channel.NotifyDisconnect(make(chan *amqp.Error, 1)),
 	}
 	return publisher, nil
 }
